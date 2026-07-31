@@ -157,14 +157,19 @@ def run(source, sector_deg, ttl_s, headless=False):
         return
 
     plt.ion()
-    fig = plt.figure(figsize=(8, 7))
+    fig = plt.figure(figsize=(10, 8.5))
     ax = fig.add_subplot(projection="3d")
     style_axes(ax, pmap.max_mm)
-    scat = ax.scatter([], [], [], s=25, c=[], cmap="turbo_r",
-                      norm=Normalize(0, pmap.max_mm), depthshade=False)
-    beam, = ax.plot([0, 0], [0, 0], [0, 0], color="#39ff14", lw=1.5, alpha=0.8)
-    title = ax.set_title("scanning...")
-    fig.colorbar(scat, ax=ax, pad=0.1, shrink=0.7, label="range (mm)")
+    # Colour temperature carries proximity: hot = close, cold = far. Normalized
+    # over the sensor's real 30..2000 mm window so the ramp isn't wasted on
+    # ranges the VL53L0X can never report.
+    scat = ax.scatter([], [], [], s=45, c=[], cmap="turbo_r",
+                      norm=Normalize(MIN_MM, pmap.max_mm), depthshade=False)
+    beam, = ax.plot([0, 0], [0, 0], [0, 0], color="#0a7f2e", lw=2.0)
+    title = ax.set_title("scanning...", fontsize=11, pad=14)
+    fig.colorbar(scat, ax=ax, pad=0.02, shrink=0.55, aspect=28,
+                 label="range (mm)  -  red = close, blue = far")
+    fig.subplots_adjust(left=0.02, right=0.90, bottom=0.04, top=0.93)
 
     last_draw = 0.0
     for _t, yaw, pitch, _roll, rng, ok in source:
@@ -198,17 +203,41 @@ def run(source, sector_deg, ttl_s, headless=False):
             break
 
 
+# Which way is which, in sensor coordinates. +X ahead, +Y left, +Z up.
+DIRECTIONS = [
+    ((1, 0, 0), "FRONT", "#c1121f"),
+    ((-1, 0, 0), "BACK", "#7d8597"),
+    ((0, 1, 0), "LEFT", "#0353a4"),
+    ((0, -1, 0), "RIGHT", "#0353a4"),
+    ((0, 0, 1), "UP", "#2a9d8f"),
+    ((0, 0, -1), "DOWN", "#7d8597"),
+]
+
+
 def style_axes(ax, max_mm):
-    ax.set_xlabel("ahead (mm)")
-    ax.set_ylabel("left (mm)")
-    ax.set_zlabel("up (mm)")
-    ax.set_xlim(-max_mm, max_mm)
-    ax.set_ylim(-max_mm, max_mm)
-    ax.set_zlim(-max_mm, max_mm)
+    # Axis numbers are the cramped part: six labelled arrows say which way is
+    # which far better than three tick-label runs, so keep ticks sparse.
+    ticks = list(range(-max_mm, max_mm + 1, 1000))
+    for setlim, setticks in ((ax.set_xlim, ax.set_xticks),
+                             (ax.set_ylim, ax.set_yticks),
+                             (ax.set_zlim, ax.set_zticks)):
+        setlim(-max_mm * 1.3, max_mm * 1.3)   # headroom so arrow labels fit
+        setticks(ticks)
+    for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+        axis.set_pane_color((1, 1, 1, 0))   # opaque panes hid the axis lines
+        axis.set_tick_params(labelsize=7, colors="#666666")
     ax.set_box_aspect((1, 1, 1))      # equal scale: geometry stays undistorted
     ax.view_init(elev=22, azim=-60)
-    ax.set_facecolor("#101014")
-    ax.scatter([0], [0], [0], c="#39ff14", s=60, marker="^")   # sensor origin
+    ax.grid(True, alpha=0.2)
+
+    # Arrows run past the cube face so a label never lands on the point cloud.
+    tip, label = max_mm * 1.0, max_mm * 1.22
+    for (dx, dy, dz), name, colour in DIRECTIONS:
+        ax.quiver(0, 0, 0, dx * tip, dy * tip, dz * tip, color=colour,
+                  arrow_length_ratio=0.08, lw=1.4, alpha=0.55)
+        ax.text(dx * label, dy * label, dz * label, name, color=colour,
+                fontsize=9, fontweight="bold", ha="center", va="center")
+    ax.scatter([0], [0], [0], c="#0a7f2e", s=70, marker="^")   # sensor origin
 
 
 def plot_static(pmap, plt, Normalize):
@@ -216,14 +245,16 @@ def plot_static(pmap, plt, Normalize):
     pts = [(pmap.angle_of(i), pmap.elev_of(j), r)
            for (i, j), (r, _) in pmap.cells.items()]
     xyz = [to_xyz(a, e, r) for a, e, r in pts]
-    fig = plt.figure(figsize=(8, 7))
+    fig = plt.figure(figsize=(10, 8.5))
     ax = fig.add_subplot(projection="3d")
     style_axes(ax, pmap.max_mm)
     sc = ax.scatter(*(zip(*xyz) if xyz else ([], [], [])),
-                    c=[r for _, _, r in pts], cmap="turbo_r", s=25,
-                    norm=Normalize(0, pmap.max_mm), depthshade=False)
-    fig.colorbar(sc, ax=ax, pad=0.1, shrink=0.7, label="range (mm)")
-    ax.set_title(f"3D obstacle map - {len(pts)} cells")
+                    c=[r for _, _, r in pts], cmap="turbo_r", s=45,
+                    norm=Normalize(MIN_MM, pmap.max_mm), depthshade=False)
+    fig.colorbar(sc, ax=ax, pad=0.02, shrink=0.55, aspect=28,
+                 label="range (mm)  -  red = close, blue = far")
+    ax.set_title(f"3D obstacle map - {len(pts)} cells", fontsize=11, pad=14)
+    fig.subplots_adjust(left=0.02, right=0.90, bottom=0.04, top=0.93)
     plt.show()
 
 
@@ -263,6 +294,16 @@ def selftest():
     assert abs(x) < 1e-6 and abs(y + 1000) < 1e-6
     x, y, z = to_xyz(0.0, 90.0, 1000)
     assert abs(z - 1000) < 1e-6 and abs(x) < 1e-6
+
+    # The arrows must point where to_xyz actually puts things, or the labels
+    # lie -- which is exactly the bug the arrows were added to prevent.
+    named = {n: v for v, n, _ in DIRECTIONS}
+    for (az, el), name in (((0, 0), "FRONT"), ((180, 0), "BACK"),
+                           ((-90, 0), "LEFT"), ((90, 0), "RIGHT"),
+                           ((0, 90), "UP"), ((0, -90), "DOWN")):
+        got = to_xyz(az, el, 1000)
+        want = named[name]
+        assert all(abs(g / 1000 - w) < 1e-6 for g, w in zip(got, want)), name
 
     assert parse_line("#header") is None
     assert parse_line("1,2,3") is None

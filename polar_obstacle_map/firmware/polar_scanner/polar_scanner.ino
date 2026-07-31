@@ -23,7 +23,19 @@
 #define ZUPT_DPS           1.2f     // below this the head is "still": don't integrate yaw
 #define YAW_SCALE          1.0f     // spin exactly 360 deg; if it reads 352, set 360/352
 #define COMP_ALPHA         0.98f    // complementary filter for pitch/roll
-#define RANGE_TIMING_MS    33       // VL53L0X continuous-mode budget
+#define RANGE_TIMING_MS    250       // VL53L0X continuous-mode inter-measurement period
+#define RANGE_BUDGET_US    33000    // per-shot integration time; longer = more range,
+                                    // slower. Keep RANGE_TIMING_MS >= this / 1000.
+
+// ---- mount: which raw MPU axis is the ToF bore, +Y (left), +Z (up)? --------
+// Each entry picks a raw MPU axis and a sign: 1=+X 2=+Y 3=+Z, negate for -.
+// Measured from run1.csv: with the bore pointing up, gravity sat on raw +X
+// (+1.00,-0.01,-0.05), so the bore IS the MPU's +X axis.
+// Send 'm' over serial to print the raw accel and read your own mount off it:
+// hold the bore straight up, whichever axis reads ~+9.8 is MOUNT_FWD.
+#define MOUNT_FWD           1      // ToF +X (bore / ahead)
+#define MOUNT_LEFT          2      // ToF +Y (left)
+#define MOUNT_UP            3      // ToF +Z (up)
 // ---------------------------------------------------------------------------
 
 Adafruit_MPU6050 mpu;
@@ -37,15 +49,23 @@ uint8_t rangeOk = 0;
 
 static const float RAD2DEG = 57.2957795f;
 
-// The MPU6050 sits perpendicular to the ToF bore: rotated +90 deg about its
-// own Y axis. So the board's yaw axis is the MPU's -X, not its Z. Rotate both
-// the gyro and accel vectors once here -- R_y(90) gives x<-z, y<-y, z<--x --
-// and every formula downstream stays in the ToF's frame.
+// Remap raw MPU axes into the ToF's frame (+X bore, +Y left, +Z up) using the
+// MOUNT_* knobs above. Doing it once here means every formula downstream --
+// yaw integration, the complementary filter, the CSV -- stays in the ToF frame.
 // If yaw runs backwards after this, set YAW_SCALE negative.
+static inline float pickAxis(int sel, float x, float y, float z) {
+  switch (sel) {
+    case  1: return  x;   case -1: return -x;
+    case  2: return  y;   case -2: return -y;
+    case  3: return  z;   default: return (sel == -3) ? -z : 0.0f;
+  }
+}
+
 static inline void mountRotate(float &x, float &y, float &z) {
-  float ox = x;
-  x = z;
-  z = -ox;
+  float ox = x, oy = y, oz = z;
+  x = pickAxis(MOUNT_FWD,  ox, oy, oz);
+  y = pickAxis(MOUNT_LEFT, ox, oy, oz);
+  z = pickAxis(MOUNT_UP,   ox, oy, oz);
 }
 
 static float wrap180(float a) {
@@ -93,6 +113,12 @@ void setup() {
     Serial.println(F("# ERROR: VL53L0X not found at 0x29"));
     while (1) delay(1000);
   }
+  // Default profile caps out around 30 cm: it wants 0.25 MCPS of return signal
+  // and uses short VCSEL pulses, so weak far returns are binned as status 4.
+  // Long range drops the limit to 0.1 MCPS and lengthens the pulses -> ~2 m.
+  tof.configSensor(Adafruit_VL53L0X::VL53L0X_SENSE_LONG_RANGE);
+  // Longer budget = more photons integrated per shot = the 2 m returns survive.
+  tof.setMeasurementTimingBudgetMicroSeconds(200000);
   tof.startRangeContinuous(RANGE_TIMING_MS);
 
   calibrateGyro();
@@ -101,11 +127,21 @@ void setup() {
 }
 
 void loop() {
-  // 'z' zeroes the heading (point straight ahead first), 'c' recalibrates.
+  // 'z' zeroes the heading (point straight ahead first), 'c' recalibrates,
+  // 'm' prints raw accel so you can read your mount off it (see MOUNT_* above).
   if (Serial.available()) {
     char c = Serial.read();
     if (c == 'z') { yaw = 0.0f; Serial.println(F("# yaw zeroed")); }
     else if (c == 'c') calibrateGyro();
+    else if (c == 'm') {
+      sensors_event_t ma, mg, mt;
+      mpu.getEvent(&ma, &mg, &mt);
+      Serial.print(F("# raw accel x,y,z m/s^2: "));
+      Serial.print(ma.acceleration.x, 2); Serial.print(',');
+      Serial.print(ma.acceleration.y, 2); Serial.print(',');
+      Serial.println(ma.acceleration.z, 2);
+      Serial.println(F("# bore straight up: axis reading ~+9.8 is MOUNT_FWD"));
+    }
   }
 
   uint32_t now = micros();
@@ -130,9 +166,13 @@ void loop() {
   if (fabsf(gz) > ZUPT_DPS) yaw = wrap180(yaw + gz * dt * YAW_SCALE);
 
   // Gravity gives absolute pitch/roll; blend to kill gyro drift on those axes.
-  float accPitch = atan2f(-rax, sqrtf(ray * ray + raz * raz)) * RAD2DEG;
+  // Sign: at rest the accel reads +9.8 along whichever axis points up, so bore
+  // straight up puts +g on ToF +X and must read pitch = +90 -- that is the
+  // elevation the host feeds to sin() for the Z coordinate. Rotation about
+  // +Y (left) by the right-hand rule tips the bore down, so gy is subtracted.
+  float accPitch = atan2f(rax, sqrtf(ray * ray + raz * raz)) * RAD2DEG;
   float accRoll  = atan2f(ray, raz) * RAD2DEG;
-  pitch = COMP_ALPHA * (pitch + gy * dt) + (1.0f - COMP_ALPHA) * accPitch;
+  pitch = COMP_ALPHA * (pitch - gy * dt) + (1.0f - COMP_ALPHA) * accPitch;
   roll  = COMP_ALPHA * (roll  + gx * dt) + (1.0f - COMP_ALPHA) * accRoll;
 
   // Non-blocking range read: keeps the integration loop at a steady dt.
