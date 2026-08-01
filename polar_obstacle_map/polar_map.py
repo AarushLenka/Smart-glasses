@@ -75,11 +75,20 @@ class PolarMap:
                 out.append((self.angle_of(i), self.elev_of(j), r, age))
         return out
 
-    def nearest(self, now, fov_deg=60.0):
-        """Closest obstacle within the forward fov_deg cone, or (range, az) None."""
-        ahead = [(r, a) for a, e, r, _ in self.snapshot(now)
-                 if abs(a) <= fov_deg / 2 and abs(e) <= fov_deg / 2]
+    def nearest(self, now, fov_deg=60.0, heading=0.0):
+        """Closest obstacle in the cone around `heading`, or None.
+
+        Returns (range_mm, az_deg) with az relative to `heading`, so it lines up
+        with what the plot draws.
+        """
+        ahead = [(r, wrap180(a - heading)) for a, e, r, _ in self.snapshot(now)
+                 if abs(wrap180(a - heading)) <= fov_deg / 2 and abs(e) <= fov_deg / 2]
         return min(ahead) if ahead else None
+
+
+def wrap180(a):
+    """Fold an angle into [-180, 180)."""
+    return (a + 180.0) % 360.0 - 180.0
 
 
 def to_xyz(az_deg, el_deg, r_mm):
@@ -150,10 +159,13 @@ def run(source, sector_deg, ttl_s, headless=False):
     pmap = PolarMap(sector_deg=sector_deg, ttl_s=ttl_s)
 
     if headless:
+        heading = 0.0
         for yaw, pitch, rng, ok in ((s[1], s[2], s[4], s[5]) for s in source):
+            heading = yaw
             if ok:
                 pmap.update(yaw, rng, time.time(), pitch)
-        plot_static(pmap, plt, Normalize)
+        # No "now" in a finished run, so FRONT is where the scanner ended up.
+        plot_static(pmap, plt, Normalize, heading)
         return
 
     plt.ion()
@@ -180,20 +192,25 @@ def run(source, sector_deg, ttl_s, headless=False):
             continue
         last_draw = now
 
+        # Cells are stored in the world frame (yaw as integrated since boot),
+        # but the plot is drawn head-relative: subtract the live yaw so FRONT is
+        # always wherever the scanner is pointing right now and the cloud swings
+        # around it. Elevation is absolute (gravity-referenced), so UP/DOWN and
+        # the pitch of every point stay untouched.
         pts = pmap.snapshot(now)
         if pts:
-            xyz = [to_xyz(a, e, r) for a, e, r, _ in pts]
+            xyz = [to_xyz(a - yaw, e, r) for a, e, r, _ in pts]
             rr = [r for _, _, r, _ in pts]
             # _offsets3d is the only way to update a 3D scatter in place;
             # set_offsets is 2D-only. Private, but stable across matplotlib 3.x.
             scat._offsets3d = tuple(zip(*xyz))
             scat.set_array(rr)
             scat.set_alpha([max(0.15, 1.0 - a / ttl_s) for _, _, _, a in pts])
-        bx, by, bz = to_xyz(yaw, pitch, pmap.max_mm)
+        bx, by, bz = to_xyz(0.0, pitch, pmap.max_mm)   # head-relative: beam is FRONT
         beam.set_data([0, bx], [0, by])
         beam.set_3d_properties([0, bz])
 
-        near = pmap.nearest(now)
+        near = pmap.nearest(now, heading=yaw)
         title.set_text(f"yaw {yaw:6.1f}  pitch {pitch:5.1f}  cells {len(pts):4d}   "
                        + (f"nearest ahead {near[0]:4d} mm @ {near[1]:.0f}deg"
                           if near else "path clear"))
@@ -203,7 +220,9 @@ def run(source, sector_deg, ttl_s, headless=False):
             break
 
 
-# Which way is which, in sensor coordinates. +X ahead, +Y left, +Z up.
+# Which way is which, in head-relative coordinates: +X is wherever the scanner
+# currently points, +Y left of it, +Z up. FRONT is a live direction, not a fixed
+# compass bearing -- UP/DOWN stay absolute because elevation comes from gravity.
 DIRECTIONS = [
     ((1, 0, 0), "FRONT", "#c1121f"),
     ((-1, 0, 0), "BACK", "#7d8597"),
@@ -240,9 +259,10 @@ def style_axes(ax, max_mm):
     ax.scatter([0], [0], [0], c="#0a7f2e", s=70, marker="^")   # sensor origin
 
 
-def plot_static(pmap, plt, Normalize):
+def plot_static(pmap, plt, Normalize, heading=0.0):
     # Whole-run summary: ignore TTL, every cell ever filled is interesting.
-    pts = [(pmap.angle_of(i), pmap.elev_of(j), r)
+    # Same head-relative rotation as the live view -- FRONT is `heading`.
+    pts = [(pmap.angle_of(i) - heading, pmap.elev_of(j), r)
            for (i, j), (r, _) in pmap.cells.items()]
     xyz = [to_xyz(a, e, r) for a, e, r in pts]
     fig = plt.figure(figsize=(10, 8.5))
@@ -286,6 +306,19 @@ def selftest():
     assert m.nearest(t + 3.0) == (900, 5.0)   # the 40 deg cell is outside the cone
     m.update(150.0, 100, t + 3.0)             # behind: outside the forward FOV
     assert m.nearest(t + 3.0)[0] == 900
+
+    # Head-relative: turn to face 150 deg and the cell behind you is now ahead,
+    # reported at ~0 deg relative. This is what the plot rotates by.
+    r, rel = m.nearest(t + 3.0, heading=150.0)
+    assert r == 100 and abs(rel) <= m.sector_deg   # within one cell of dead ahead
+    assert wrap180(-190.0) == 170.0 and wrap180(190.0) == -170.0
+
+    # Rotating the whole cloud by the heading must not touch elevation: a point
+    # 90 deg to the world-right, viewed while facing it, lands on FRONT (+X).
+    x, y, z = to_xyz(90.0 - 90.0, 30.0, 1000)
+    ux, uy, uz = to_xyz(90.0, 30.0, 1000)
+    assert abs(z - uz) < 1e-9                 # elevation survives the rotation
+    assert x > 0 and abs(y) < 1e-9            # and it is dead ahead now
 
     # Straight ahead, level -> pure +X. Yaw right (+90) -> -Y. Pitch up -> +Z.
     x, y, z = to_xyz(0.0, 0.0, 1000)

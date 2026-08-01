@@ -23,9 +23,9 @@
 #define ZUPT_DPS           1.2f     // below this the head is "still": don't integrate yaw
 #define YAW_SCALE          1.0f     // spin exactly 360 deg; if it reads 352, set 360/352
 #define COMP_ALPHA         0.98f    // complementary filter for pitch/roll
-#define RANGE_TIMING_MS    250       // VL53L0X continuous-mode inter-measurement period
-#define RANGE_BUDGET_US    33000    // per-shot integration time; longer = more range,
-                                    // slower. Keep RANGE_TIMING_MS >= this / 1000.
+#define RANGE_PERIOD_MS    500       // one shot every 500 ms = 2 measurements/s
+#define RANGE_BUDGET_US    300000    // per-shot integration time; longer = more range,
+                                    // slower. Keep RANGE_PERIOD_MS >= this / 1000.
 
 // ---- mount: which raw MPU axis is the ToF bore, +Y (left), +Z (up)? --------
 // Each entry picks a raw MPU axis and a sign: 1=+X 2=+Y 3=+Z, negate for -.
@@ -44,6 +44,8 @@ Adafruit_VL53L0X tof;
 float yaw = 0.0f, pitch = 0.0f, roll = 0.0f;
 float gxBias = 0, gyBias = 0, gzBias = 0;
 uint32_t lastMicros = 0;
+uint32_t lastShotMs = 0;
+bool rangePending = false;
 uint16_t rangeMm = 0;
 uint8_t rangeOk = 0;
 
@@ -118,8 +120,7 @@ void setup() {
   // Long range drops the limit to 0.1 MCPS and lengthens the pulses -> ~2 m.
   tof.configSensor(Adafruit_VL53L0X::VL53L0X_SENSE_LONG_RANGE);
   // Longer budget = more photons integrated per shot = the 2 m returns survive.
-  tof.setMeasurementTimingBudgetMicroSeconds(200000);
-  tof.startRangeContinuous(RANGE_TIMING_MS);
+  tof.setMeasurementTimingBudgetMicroSeconds(RANGE_BUDGET_US);
 
   calibrateGyro();
   Serial.println(F("# t_ms,yaw_deg,pitch_deg,roll_deg,range_mm,ok"));
@@ -175,9 +176,16 @@ void loop() {
   pitch = COMP_ALPHA * (pitch - gy * dt) + (1.0f - COMP_ALPHA) * accPitch;
   roll  = COMP_ALPHA * (roll  + gx * dt) + (1.0f - COMP_ALPHA) * accRoll;
 
-  // Non-blocking range read: keeps the integration loop at a steady dt.
-  if (tof.isRangeComplete()) {
-    uint16_t r = tof.readRange();
+  // Non-blocking range: startRange/isRangeComplete/readRangeResult is the
+  // async triple. readRange() is NOT -- it forces SINGLE_RANGING and blocks
+  // for a whole budget, which is what pinned the old build at ~3 shots/s and
+  // made the inter-measurement period a no-op. One shot per RANGE_PERIOD_MS.
+  if (!rangePending && millis() - lastShotMs >= RANGE_PERIOD_MS) {
+    lastShotMs = millis();
+    rangePending = tof.startRange();
+  } else if (rangePending && tof.isRangeComplete()) {
+    uint16_t r = tof.readRangeResult();          // also clears the interrupt
+    rangePending = false;
     rangeOk = (tof.readRangeStatus() == 0) ? 1 : 0;   // 4 = out of range
     if (rangeOk) rangeMm = r;
   }
